@@ -682,15 +682,28 @@ def editor_close(args: argparse.Namespace) -> None:
     if not workspace_id:
         raise WorkbenchError("current Herdr workspace is unavailable")
     force = bool(getattr(args, "force", False))
+    expected_pane_id = getattr(args, "expected_pane_id", None)
     with resource_lock(f"editor-{workspace_id}"):
         path = editor_state_path(workspace_id)
         if not path.exists():
+            if expected_pane_id is not None:
+                raise WorkbenchError(
+                    "managed editor pane changed before close",
+                    code="editor_pane_changed",
+                    details={"expectedPaneId": expected_pane_id, "currentPaneId": None},
+                )
             # Closing an already absent editor is a safe no-op.  In particular,
             # it must not claim that an unknown editor was clean.
             emit({"action": "editor.close", "paneId": None, "closed": False})
             return
         record = read_json(path)
         pane_id, server = _owned_editor_record(record, workspace_id)
+        if expected_pane_id is not None and expected_pane_id != pane_id:
+            raise WorkbenchError(
+                "managed editor pane changed before close",
+                code="editor_pane_changed",
+                details={"expectedPaneId": expected_pane_id, "currentPaneId": pane_id},
+            )
         if record.get("closedAt") and record.get("running") is False:
             emit(
                 {
@@ -1524,6 +1537,7 @@ def parser() -> argparse.ArgumentParser:
     editor_open_parser.set_defaults(handler=editor_open)
     editor_commands.add_parser("status").set_defaults(handler=editor_status)
     editor_close_parser = editor_commands.add_parser("close")
+    editor_close_parser.add_argument("--expected-pane-id")
     editor_close_parser.add_argument("--force", action="store_true")
     editor_close_parser.set_defaults(handler=editor_close)
 

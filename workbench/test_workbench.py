@@ -337,6 +337,39 @@ class WorkbenchTest(unittest.TestCase):
             self.assertTrue(emit.call_args.args[0]["closed"])
             self.assertFalse(emit.call_args.args[0]["forced"])
 
+    def test_editor_close_refuses_when_expected_pane_was_replaced(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            editor_state = state / "editors/w1.json"
+            editor_state.parent.mkdir(parents=True)
+            editor_state.write_text(json.dumps({
+                "kind": "editor",
+                "workspaceId": "w1",
+                "paneId": "w1:p9",
+                "server": "/tmp/replacement.sock",
+            }))
+            with (
+                mock.patch.dict(os.environ, {"WORKBENCH_STATE_DIR": str(state)}),
+                mock.patch.object(workbench, "require_herdr_context", return_value=self.context()),
+                mock.patch.object(workbench, "pane_presence") as pane_presence,
+                mock.patch.object(workbench, "_query_modified_buffers") as query,
+                mock.patch.object(workbench, "close_plugin_pane") as close,
+                self.assertRaises(workbench.WorkbenchError) as raised,
+            ):
+                workbench.editor_close(argparse.Namespace(
+                    force=True,
+                    expected_pane_id="w1:p2",
+                ))
+            self.assertEqual(raised.exception.code, "editor_pane_changed")
+            self.assertEqual(raised.exception.details, {
+                "expectedPaneId": "w1:p2",
+                "currentPaneId": "w1:p9",
+            })
+            pane_presence.assert_not_called()
+            query.assert_not_called()
+            close.assert_not_called()
+            self.assertEqual(json.loads(editor_state.read_text())["paneId"], "w1:p9")
+
     def test_editor_close_refuses_when_dirty_state_cannot_be_inspected(self):
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary) / "state"
