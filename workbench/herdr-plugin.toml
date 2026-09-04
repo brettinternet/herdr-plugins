@@ -1,0 +1,36 @@
+id = "brettinternet.workbench"
+name = "Agent workbench"
+version = "0.1.0"
+min_herdr_version = "0.8.2"
+description = "Open managed editors and Git UIs, and run observable foreground jobs"
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "open-editor"
+title = "Open workbench editor"
+contexts = ["pane"]
+command = ["python3", "workbench.py", "_open_editor_action"]
+
+[[actions]]
+id = "open-lazygit"
+title = "Open workbench lazygit"
+contexts = ["pane"]
+command = ["python3", "workbench.py", "_open_lazygit_action"]
+
+[[panes]]
+id = "editor"
+title = "Workbench editor"
+placement = "split"
+command = ["sh", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/workbench.py\" _editor"]
+
+[[panes]]
+id = "job"
+title = "Workbench job"
+placement = "split"
+command = ["sh", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/workbench.py\" _job"]
+
+[[panes]]
+id = "lazygit"
+title = "Workbench lazygit"
+placement = "split"
+command = ["sh", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/workbench.py\" _lazygit"]
