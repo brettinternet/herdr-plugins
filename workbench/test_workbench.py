@@ -9,11 +9,10 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import redirect_stderr
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
-
 
 SCRIPT = Path(__file__).with_name("workbench.py")
 spec = importlib.util.spec_from_file_location("workbench", SCRIPT)
@@ -158,6 +157,289 @@ class WorkbenchTest(unittest.TestCase):
             focus.assert_called_once_with("w1:p2")
             pane_open.assert_not_called()
 
+    def test_modified_buffer_query_is_fixed_typed_json_and_normalized(self):
+        output = json.dumps(
+            [
+                {"id": 7, "name": ""},
+                {"id": 8, "name": "x" * (workbench.MAX_BUFFER_NAME_LENGTH + 20)},
+            ]
+        )
+        completed = subprocess.CompletedProcess(
+            ["nvim"], 0, stdout=output, stderr=""
+        )
+        with (
+            mock.patch.object(workbench, "nvim_binary", return_value="nvim"),
+            mock.patch.object(workbench, "run", return_value=completed) as run,
+        ):
+            buffers = workbench.modified_buffers("/tmp/editor.sock")
+        self.assertEqual(
+            buffers,
+            [
+                {"id": 7, "name": workbench.UNNAMED_BUFFER_NAME},
+                {"id": 8, "name": "x" * workbench.MAX_BUFFER_NAME_LENGTH},
+            ],
+        )
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "nvim",
+                "--server",
+                "/tmp/editor.sock",
+                "--remote-expr",
+                workbench.NVIM_MODIFIED_BUFFERS_EXPR,
+            ],
+        )
+        self.assertIn("getbufinfo", workbench.NVIM_MODIFIED_BUFFERS_EXPR)
+        self.assertIn("json_encode", workbench.NVIM_MODIFIED_BUFFERS_EXPR)
+
+    def test_modified_buffer_query_bounds_count(self):
+        output = json.dumps(
+            [{"id": index, "name": str(index)} for index in range(1, 5)]
+        )
+        completed = subprocess.CompletedProcess(["nvim"], 0, stdout=output, stderr="")
+        with (
+            mock.patch.object(workbench, "MAX_DIRTY_BUFFERS", 2),
+            mock.patch.object(workbench, "run", return_value=completed),
+            mock.patch.object(workbench, "nvim_binary", return_value="nvim"),
+        ):
+            buffers, truncated = workbench._query_modified_buffers("/tmp/editor.sock")
+        self.assertEqual(buffers, [{"id": 1, "name": "1"}, {"id": 2, "name": "2"}])
+        self.assertTrue(truncated)
+
+    def test_editor_status_reports_bounded_dirty_buffers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            editor_state = state / "editors/w1.json"
+            editor_state.parent.mkdir(parents=True)
+            editor_state.write_text(
+                json.dumps(
+                    {
+                        "kind": "editor",
+                        "workspaceId": "w1",
+                        "paneId": "w1:p2",
+                        "server": "/tmp/nvim.sock",
+                    }
+                )
+            )
+            dirty = [{"id": 3, "name": workbench.UNNAMED_BUFFER_NAME}]
+            with (
+                mock.patch.dict(os.environ, {"WORKBENCH_STATE_DIR": str(state)}),
+                mock.patch.object(workbench, "require_herdr_context", return_value=self.context()),
+                mock.patch.object(workbench, "pane_presence", return_value=True),
+                mock.patch.object(workbench, "_query_modified_buffers", return_value=(dirty, False)),
+                mock.patch.object(workbench, "emit") as emit,
+            ):
+                workbench.editor_status(argparse.Namespace())
+            record = emit.call_args.args[0]["editor"]
+            self.assertTrue(record["running"])
+            self.assertTrue(record["dirty"])
+            self.assertEqual(record["dirtyBuffers"], dirty)
+            self.assertEqual(record["dirtyBufferCount"], 1)
+            self.assertFalse(record["dirtyBuffersTruncated"])
+
+    def test_editor_status_stale_pane_does_not_assert_clean(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            editor_state = state / "editors/w1.json"
+            editor_state.parent.mkdir(parents=True)
+            editor_state.write_text(
+                json.dumps(
+                    {
+                        "kind": "editor",
+                        "workspaceId": "w1",
+                        "paneId": "w1:p2",
+                        "server": "/tmp/nvim.sock",
+                        "dirty": True,
+                        "dirtyBuffers": [{"id": 1, "name": "old.py"}],
+                    }
+                )
+            )
+            with (
+                mock.patch.dict(os.environ, {"WORKBENCH_STATE_DIR": str(state)}),
+                mock.patch.object(workbench, "require_herdr_context", return_value=self.context()),
+                mock.patch.object(workbench, "pane_presence", return_value=False),
+                mock.patch.object(workbench, "_query_modified_buffers") as query,
+                mock.patch.object(workbench, "emit") as emit,
+            ):
+                workbench.editor_status(argparse.Namespace())
+            record = emit.call_args.args[0]["editor"]
+            self.assertFalse(record["running"])
+            self.assertTrue(record["stale"])
+            self.assertIsNone(record["dirty"])
+            self.assertIsNone(record["dirtyBuffers"])
+            query.assert_not_called()
+
+    def test_editor_close_refuses_named_unnamed_and_multiple_dirty_buffers(self):
+        cases = [
+            ([{"id": 4, "name": "changed.py"}], False),
+            ([{"id": 5, "name": workbench.UNNAMED_BUFFER_NAME}], False),
+            (
+                [{"id": index, "name": f"changed-{index}.py"} for index in range(1, 4)],
+                True,
+            ),
+        ]
+        for dirty, truncated in cases:
+            with self.subTest(dirty=dirty, truncated=truncated), tempfile.TemporaryDirectory() as temporary:
+                state = Path(temporary) / "state"
+                editor_state = state / "editors/w1.json"
+                editor_state.parent.mkdir(parents=True)
+                editor_state.write_text(
+                    json.dumps(
+                        {
+                            "kind": "editor",
+                            "workspaceId": "w1",
+                            "paneId": "w1:p2",
+                            "server": "/tmp/nvim.sock",
+                        }
+                    )
+                )
+                with (
+                    mock.patch.dict(os.environ, {"WORKBENCH_STATE_DIR": str(state)}),
+                    mock.patch.object(workbench, "require_herdr_context", return_value=self.context()),
+                    mock.patch.object(workbench, "pane_presence", return_value=True),
+                    mock.patch.object(
+                        workbench,
+                        "_query_modified_buffers",
+                        return_value=(dirty, truncated),
+                    ),
+                    mock.patch.object(workbench, "close_plugin_pane") as close,
+                    self.assertRaises(workbench.WorkbenchError) as raised,
+                ):
+                    workbench.editor_close(argparse.Namespace(force=False))
+                self.assertEqual(raised.exception.code, "editor_dirty")
+                self.assertEqual(raised.exception.details["dirtyBuffers"], dirty)
+                self.assertEqual(
+                    raised.exception.details["dirtyBuffersTruncated"], truncated
+                )
+                close.assert_not_called()
+
+    def test_clean_editor_closes_normally(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            editor_state = state / "editors/w1.json"
+            editor_state.parent.mkdir(parents=True)
+            editor_state.write_text(json.dumps({
+                "kind": "editor",
+                "workspaceId": "w1",
+                "paneId": "w1:p2",
+                "server": "/tmp/nvim.sock",
+            }))
+            with (
+                mock.patch.dict(os.environ, {"WORKBENCH_STATE_DIR": str(state)}),
+                mock.patch.object(workbench, "require_herdr_context", return_value=self.context()),
+                mock.patch.object(workbench, "pane_presence", return_value=True),
+                mock.patch.object(workbench, "_query_modified_buffers", return_value=([], False)),
+                mock.patch.object(workbench, "close_plugin_pane") as close,
+                mock.patch.object(workbench, "emit") as emit,
+            ):
+                workbench.editor_close(argparse.Namespace(force=False))
+            close.assert_called_once_with("w1:p2")
+            self.assertTrue(emit.call_args.args[0]["closed"])
+            self.assertFalse(emit.call_args.args[0]["forced"])
+
+    def test_editor_close_refuses_when_dirty_state_cannot_be_inspected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            editor_state = state / "editors/w1.json"
+            editor_state.parent.mkdir(parents=True)
+            editor_state.write_text(json.dumps({
+                "kind": "editor",
+                "workspaceId": "w1",
+                "paneId": "w1:p2",
+                "server": "/tmp/stale.sock",
+            }))
+            with (
+                mock.patch.dict(os.environ, {"WORKBENCH_STATE_DIR": str(state)}),
+                mock.patch.object(workbench, "require_herdr_context", return_value=self.context()),
+                mock.patch.object(workbench, "pane_presence", return_value=True),
+                mock.patch.object(
+                    workbench,
+                    "_query_modified_buffers",
+                    side_effect=workbench.WorkbenchError(
+                        "server unavailable", code="editor_dirty_unknown"
+                    ),
+                ),
+                mock.patch.object(workbench, "close_plugin_pane") as close,
+                self.assertRaises(workbench.WorkbenchError) as raised,
+            ):
+                workbench.editor_close(argparse.Namespace(force=False))
+            self.assertEqual(raised.exception.code, "editor_dirty_unknown")
+            self.assertIsNone(raised.exception.details["dirtyBuffers"])
+            close.assert_not_called()
+
+    def test_editor_dirty_error_is_machine_readable_from_main(self):
+        dirty = [{"id": 4, "name": "changed.py"}]
+        with (
+            mock.patch.object(
+                workbench,
+                "editor_close",
+                side_effect=workbench.WorkbenchError(
+                    "refusing to close editor with modified buffers",
+                    code="editor_dirty",
+                    details={"dirtyBuffers": dirty},
+                ),
+            ),
+            mock.patch.object(sys, "argv", ["workbench", "editor", "close"]),
+            redirect_stderr(io.StringIO()) as errors,
+            self.assertRaises(SystemExit) as exited,
+        ):
+            workbench.main()
+        self.assertEqual(exited.exception.code, 1)
+        payload = json.loads(errors.getvalue())
+        self.assertEqual(payload["error"]["code"], "editor_dirty")
+        self.assertEqual(payload["error"]["dirtyBuffers"], dirty)
+
+    def test_editor_force_close_is_plugin_scoped_and_idempotent_for_stale_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            editor_state = state / "editors/w1.json"
+            editor_state.parent.mkdir(parents=True)
+            editor_state.write_text(
+                json.dumps(
+                    {
+                        "kind": "editor",
+                        "workspaceId": "w1",
+                        "paneId": "w1:p2",
+                        "server": "/tmp/nvim.sock",
+                    }
+                )
+            )
+            with (
+                mock.patch.dict(os.environ, {"WORKBENCH_STATE_DIR": str(state)}),
+                mock.patch.object(workbench, "require_herdr_context", return_value=self.context()),
+                mock.patch.object(workbench, "pane_presence", return_value=True),
+                mock.patch.object(workbench, "close_plugin_pane") as close,
+                mock.patch.object(workbench, "emit") as emit,
+            ):
+                workbench.editor_close(argparse.Namespace(force=True))
+            close.assert_called_once_with("w1:p2")
+            self.assertTrue(emit.call_args.args[0]["closed"])
+
+            with (
+                mock.patch.dict(os.environ, {"WORKBENCH_STATE_DIR": str(state)}),
+                mock.patch.object(workbench, "require_herdr_context", return_value=self.context()),
+                mock.patch.object(workbench, "pane_presence", return_value=False),
+                mock.patch.object(workbench, "close_plugin_pane") as close_again,
+                mock.patch.object(workbench, "emit") as emit_again,
+            ):
+                workbench.editor_close(argparse.Namespace(force=True))
+            close_again.assert_not_called()
+            self.assertTrue(emit_again.call_args.args[0]["alreadyClosed"])
+
+    def test_editor_close_missing_state_is_idempotent_noop(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                mock.patch.dict(os.environ, {"WORKBENCH_STATE_DIR": str(Path(temporary) / "state")}),
+                mock.patch.object(workbench, "require_herdr_context", return_value=self.context()),
+                mock.patch.object(workbench, "emit") as emit,
+            ):
+                workbench.editor_close(argparse.Namespace(force=False))
+            self.assertEqual(emit.call_args.args[0], {
+                "action": "editor.close",
+                "paneId": None,
+                "closed": False,
+            })
+
     def test_concurrent_editor_opens_create_one_workspace_pane(self):
         with tempfile.TemporaryDirectory() as temporary:
             target = Path(temporary) / "file.py"
@@ -180,9 +462,9 @@ class WorkbenchTest(unittest.TestCase):
                 mock.patch.object(workbench, "pane_exists", return_value=True),
                 mock.patch.object(workbench, "open_in_nvim"),
                 mock.patch.object(workbench, "emit"),
+                ThreadPoolExecutor(max_workers=2) as executor,
             ):
-                with ThreadPoolExecutor(max_workers=2) as executor:
-                    list(executor.map(workbench.editor_open, [args, args]))
+                list(executor.map(workbench.editor_open, [args, args]))
             pane_open.assert_called_once()
 
     def test_editor_closes_new_pane_when_nvim_does_not_start(self):
@@ -204,9 +486,9 @@ class WorkbenchTest(unittest.TestCase):
                 mock.patch.object(workbench, "plugin_pane_open", return_value={"paneId": "w1:p2"}),
                 mock.patch.object(workbench, "wait_for_nvim", side_effect=workbench.WorkbenchError("timeout")),
                 mock.patch.object(workbench, "close_plugin_pane") as close,
+                self.assertRaises(workbench.WorkbenchError),
             ):
-                with self.assertRaises(workbench.WorkbenchError):
-                    workbench.editor_open(args)
+                workbench.editor_open(args)
             close.assert_called_once_with("w1:p2")
 
     def test_job_start_strips_argument_separator_and_records_owned_pane(self):
@@ -515,6 +797,100 @@ class WorkbenchTest(unittest.TestCase):
             ):
                 workbench.job_cancel(argparse.Namespace(job_id="job-abc"))
             self.assertEqual(json.loads(path.read_text())["status"], "cancelled")
+
+    def test_job_close_force_waits_for_terminal_state_before_closing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            jobs = state / "jobs"
+            jobs.mkdir(parents=True)
+            path = jobs / "job-abc.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "kind": "job",
+                        "jobId": "job-abc",
+                        "workspaceId": "w1",
+                        "paneId": "w1:p5",
+                        "status": "running",
+                    }
+                )
+            )
+
+            def finish_cancellation(job_path, _pane_id):
+                with workbench.locked_json(job_path) as record:
+                    record["status"] = "cancelled"
+                    record["exitCode"] = 130
+                    record["finishedAt"] = workbench.now()
+                return json.loads(job_path.read_text())
+
+            with (
+                mock.patch.dict(os.environ, {"WORKBENCH_STATE_DIR": str(state)}),
+                mock.patch.object(workbench, "pane_presence", side_effect=[True, True]),
+                mock.patch.object(workbench, "herdr") as herdr,
+                mock.patch.object(workbench, "_wait_for_job_terminal", side_effect=finish_cancellation),
+                mock.patch.object(workbench, "close_plugin_pane") as close,
+                mock.patch.object(workbench, "emit") as emit,
+            ):
+                workbench.job_close(argparse.Namespace(job_id="job-abc", force=True))
+            herdr.assert_called_once_with("pane", "send-keys", "w1:p5", "ctrl+c")
+            close.assert_called_once_with("w1:p5")
+            self.assertEqual(json.loads(path.read_text())["status"], "cancelled")
+            self.assertTrue(emit.call_args.args[0]["forced"])
+
+    def test_job_close_force_reconciles_gone_pane_without_closing_another_pane(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            jobs = state / "jobs"
+            jobs.mkdir(parents=True)
+            path = jobs / "job-abc.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "kind": "job",
+                        "jobId": "job-abc",
+                        "workspaceId": "w1",
+                        "paneId": "w1:p5",
+                        "status": "cancelling",
+                    }
+                )
+            )
+            with (
+                mock.patch.dict(os.environ, {"WORKBENCH_STATE_DIR": str(state)}),
+                mock.patch.object(workbench, "pane_presence", return_value=False),
+                mock.patch.object(workbench, "herdr") as herdr,
+                mock.patch.object(workbench, "close_plugin_pane") as close,
+                mock.patch.object(workbench, "emit"),
+            ):
+                workbench.job_close(argparse.Namespace(job_id="job-abc", force=True))
+            herdr.assert_not_called()
+            close.assert_not_called()
+            self.assertEqual(json.loads(path.read_text())["status"], "cancelled")
+
+    def test_job_close_rejects_foreign_recorded_workspace_pane(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            jobs = state / "jobs"
+            jobs.mkdir(parents=True)
+            (jobs / "job-abc.json").write_text(
+                json.dumps(
+                    {
+                        "kind": "job",
+                        "jobId": "job-abc",
+                        "workspaceId": "w1",
+                        "paneId": "w2:p5",
+                        "status": "completed",
+                    }
+                )
+            )
+            with (
+                mock.patch.dict(os.environ, {"WORKBENCH_STATE_DIR": str(state)}),
+                mock.patch.object(workbench, "pane_presence") as presence,
+                mock.patch.object(workbench, "close_plugin_pane") as close,
+                self.assertRaisesRegex(workbench.WorkbenchError, "another Herdr workspace"),
+            ):
+                workbench.job_close(argparse.Namespace(job_id="job-abc", force=False))
+            presence.assert_not_called()
+            close.assert_not_called()
 
     def test_parser_errors_are_machine_readable(self):
         errors = io.StringIO()

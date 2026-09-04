@@ -48,6 +48,8 @@ Open a file in a managed Neovim pane. The default preserves the current focus an
 "$workbench" editor open src/main.py --line 42 --placement right --no-focus
 "$workbench" editor status
 "$workbench" editor close
+# Use --force only when explicitly discarding unsaved editor changes.
+"$workbench" editor close --force
 ```
 
 Start a visible foreground job:
@@ -67,7 +69,7 @@ By default, job output is mirrored to the pane and a bounded rotating log so an 
 "$workbench" job start --interactive --placement tab --focus -- python3
 ```
 
-Completed job panes remain open at a shell until explicitly closed. `job close` refuses to close running jobs unless `--force` is supplied.
+Completed job panes remain open at a shell until explicitly closed. `job close` refuses to close running jobs unless `--force` is supplied. `editor close` refuses when Neovim reports modified buffers and returns those buffers in the structured error; `editor status` reports bounded `dirtyBuffers` details when inspection is available. `editor close --force` discards those changes only for the recorded plugin-owned editor.
 
 Open or reuse LazyGit for the current workspace:
 
@@ -88,7 +90,7 @@ Placements are `auto`, `right`, `down`, `tab`, or `zoomed`. `auto` chooses right
 
 Runtime state defaults to `${XDG_STATE_HOME:-~/.local/state}/herdr/plugins/brettinternet.workbench`, matching Herdr's injected plugin state directory. Set `WORKBENCH_STATE_DIR` to override it consistently for every invocation channel. Neovim sockets use a private per-user temporary directory to avoid Unix socket path-length limits.
 
-The controller records every pane it creates and only closes panes found through those records. Editor and LazyGit instances are scoped by Herdr workspace. Jobs receive stable `job-*` IDs and retain their exit status and captured output.
+The controller records every pane it creates and only closes panes found through those records using Herdr's plugin-scoped pane API. Editor and LazyGit instances are scoped by Herdr workspace. Jobs receive stable `job-*` IDs, record their owned process group for forced cleanup, and retain their exit status and captured output. Stale records are never treated as proof that an editor is clean.
 
 ## Agent skill
 

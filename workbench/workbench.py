@@ -8,6 +8,7 @@ import fcntl
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -25,12 +26,39 @@ POLL_INTERVAL_SECONDS = 0.05
 START_TIMEOUT_SECONDS = 10.0
 MAX_LOG_BYTES = 5 * 1024 * 1024
 READ_CHUNK_BYTES = 8192
+MAX_DIRTY_BUFFERS = 64
+MAX_BUFFER_NAME_LENGTH = 4096
+UNNAMED_BUFFER_NAME = "[No Name]"
+JOB_CLOSE_TIMEOUT_SECONDS = 2.0
+JOB_KILL_TIMEOUT_SECONDS = 0.5
+TERMINAL_JOB_STATUSES = {"completed", "failed", "cancelled"}
+ACTIVE_JOB_STATUSES = {"starting", "running", "cancelling"}
+
+# Keep this expression fixed: only the socket is supplied by the caller.  It
+# asks for one extra entry so Python can report truncation while keeping the
+# returned dirty-buffer list bounded.  The result is JSON containing the stable
+# Neovim buffer number and its name, not a stringified Vimscript value that
+# callers would need to interpret.
+NVIM_MODIFIED_BUFFERS_EXPR = (
+    'json_encode(map(getbufinfo({"bufmodified": 1})[:64], '
+    '"{\\"id\\": v:val.bufnr, \\"name\\": strcharpart(v:val.name, 0, 4096)}"))'
+)
 _PROCESS_LOCKS: dict[str, threading.Lock] = {}
 _PROCESS_LOCKS_GUARD = threading.Lock()
+_CURRENT_JOB_STATE_PATH: Path | None = None
 
 
 class WorkbenchError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "workbench_error",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = details or {}
 
 
 def now() -> str:
@@ -69,8 +97,16 @@ def emit(result: dict[str, Any]) -> None:
     print(json.dumps({"ok": True, **result}, sort_keys=True))
 
 
-def fail(message: str, *, code: str = "workbench_error") -> None:
-    print(json.dumps({"ok": False, "error": {"code": code, "message": message}}), file=sys.stderr)
+def fail(
+    message: str,
+    *,
+    code: str = "workbench_error",
+    details: dict[str, Any] | None = None,
+) -> None:
+    error: dict[str, Any] = {"code": code, "message": message}
+    if details:
+        error.update(details)
+    print(json.dumps({"ok": False, "error": error}, sort_keys=True), file=sys.stderr)
     raise SystemExit(1)
 
 
@@ -253,6 +289,13 @@ def pane_exists(pane_id: str) -> bool:
     return presence
 
 
+def checked_pane_presence(pane_id: str) -> bool | None:
+    try:
+        return pane_exists(pane_id)
+    except WorkbenchError:
+        return None
+
+
 def focus_plugin_pane(pane_id: str) -> None:
     herdr("plugin", "pane", "focus", pane_id)
 
@@ -339,6 +382,81 @@ def editor_state_path(workspace_id: str) -> Path:
     return state_root() / "editors" / f"{workspace_id}.json"
 
 
+def _normalize_modified_buffer(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise WorkbenchError(
+            "Neovim returned an invalid modified-buffer record",
+            code="editor_dirty_unknown",
+        )
+    buffer_id = value.get("id", value.get("bufnr"))
+    if isinstance(buffer_id, bool) or not isinstance(buffer_id, int) or buffer_id < 1:
+        raise WorkbenchError(
+            "Neovim returned an invalid modified-buffer ID",
+            code="editor_dirty_unknown",
+        )
+    name = value.get("name")
+    if not isinstance(name, str):
+        raise WorkbenchError(
+            "Neovim returned an invalid modified-buffer name",
+            code="editor_dirty_unknown",
+        )
+    return {
+        "id": buffer_id,
+        "name": (name or UNNAMED_BUFFER_NAME)[:MAX_BUFFER_NAME_LENGTH],
+    }
+
+
+def _query_modified_buffers(socket_path: str) -> tuple[list[dict[str, Any]], bool]:
+    try:
+        completed = run(
+            [
+                nvim_binary(),
+                "--server",
+                socket_path,
+                "--remote-expr",
+                NVIM_MODIFIED_BUFFERS_EXPR,
+            ]
+        )
+    except (subprocess.CalledProcessError, OSError) as error:
+        detail = (
+            getattr(error, "stderr", None)
+            or getattr(error, "stdout", None)
+            or str(error)
+        ).strip()
+        raise WorkbenchError(
+            f"could not inspect modified Neovim buffers: {detail}",
+            code="editor_dirty_unknown",
+        ) from error
+    try:
+        payload = json.loads(completed.stdout)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise WorkbenchError(
+            "Neovim returned invalid modified-buffer JSON",
+            code="editor_dirty_unknown",
+        ) from error
+    if not isinstance(payload, list):
+        raise WorkbenchError(
+            "Neovim returned invalid modified-buffer data",
+            code="editor_dirty_unknown",
+        )
+    truncated = len(payload) > MAX_DIRTY_BUFFERS
+    buffers = [
+        _normalize_modified_buffer(value)
+        for value in payload[:MAX_DIRTY_BUFFERS]
+    ]
+    return buffers, truncated
+
+
+def modified_buffers(socket_path: str) -> list[dict[str, Any]]:
+    return _query_modified_buffers(socket_path)[0]
+
+
+# Keep the descriptive alias available to callers that use the controller as
+# a small Python module rather than through its CLI.
+def nvim_modified_buffers(socket_path: str) -> list[dict[str, Any]]:
+    return modified_buffers(socket_path)
+
+
 def open_in_nvim(socket_path: str, path: Path, line: int, column: int) -> None:
     command = [nvim_binary(), "--server", socket_path, "--remote-silent"]
     if line > 0:
@@ -389,8 +507,11 @@ def _editor_open_locked(
     record_path = editor_state_path(workspace_id)
     if record_path.exists():
         record = read_json(record_path)
-        pane_id, server = record.get("paneId"), record.get("server")
-        if isinstance(pane_id, str) and isinstance(server, str) and pane_exists(pane_id):
+        try:
+            pane_id, server = _owned_editor_record(record, workspace_id)
+        except WorkbenchError:
+            pane_id, server = None, None
+        if isinstance(server, str) and pane_id is not None and pane_exists(pane_id):
             try:
                 open_in_nvim(server, path, args.line, args.column)
                 if args.focus:
@@ -422,6 +543,7 @@ def _editor_open_locked(
     pane_id = opened["paneId"]
     record = {
         "kind": "editor",
+        "pluginId": PLUGIN_ID,
         "workspaceId": workspace_id,
         "paneId": pane_id,
         "server": server,
@@ -439,32 +561,222 @@ def _editor_open_locked(
     emit({"action": "editor.open", "created": True, "editor": record})
 
 
+def _owned_editor_record(
+    record: dict[str, Any], workspace_id: str
+) -> tuple[str, str | None]:
+    if record.get("pluginId") not in {None, PLUGIN_ID}:
+        raise WorkbenchError(
+            "editor state belongs to another plugin",
+            code="editor_not_owned",
+        )
+    kind = record.get("kind")
+    if kind is not None and kind != "editor":
+        raise WorkbenchError(
+            "editor state does not belong to a managed editor",
+            code="editor_not_owned",
+        )
+    recorded_workspace_id = record.get("workspaceId")
+    if recorded_workspace_id is not None and recorded_workspace_id != workspace_id:
+        raise WorkbenchError(
+            "editor state belongs to another Herdr workspace",
+            code="editor_not_owned",
+        )
+    pane_id = record.get("paneId")
+    if not isinstance(pane_id, str) or not pane_id:
+        raise WorkbenchError("editor state has no pane ID", code="editor_state_invalid")
+    if ":" in pane_id and not pane_id.startswith(f"{workspace_id}:"):
+        raise WorkbenchError(
+            "editor pane belongs to another Herdr workspace",
+            code="editor_not_owned",
+        )
+    server = record.get("server")
+    if server is not None and not isinstance(server, str):
+        raise WorkbenchError(
+            "editor state has an invalid Neovim server",
+            code="editor_state_invalid",
+        )
+    return pane_id, server
+
+
+def _editor_dirty_fields(
+    record: dict[str, Any],
+    pane_is_live: bool | None,
+) -> None:
+    if pane_is_live is not True:
+        # A stale or unavailable pane cannot be treated as clean.  Drop old
+        # observations rather than exposing them as the current editor state.
+        record["dirty"] = None
+        record["dirtyBuffers"] = None
+        record.pop("dirtyBufferCount", None)
+        record.pop("dirtyBuffersTruncated", None)
+        return
+    server = record.get("server")
+    if not isinstance(server, str):
+        record["dirty"] = None
+        record["dirtyBuffers"] = None
+        return
+    try:
+        buffers, truncated = _query_modified_buffers(server)
+    except WorkbenchError:
+        record["dirty"] = None
+        record["dirtyBuffers"] = None
+        record.pop("dirtyBufferCount", None)
+        record.pop("dirtyBuffersTruncated", None)
+        return
+    record["dirty"] = bool(buffers)
+    record["dirtyBuffers"] = buffers
+    record["dirtyBufferCount"] = len(buffers)
+    record["dirtyBuffersTruncated"] = truncated
+
+
 def editor_status(_args: argparse.Namespace) -> None:
     context = require_herdr_context()
     workspace_id = str(context.get("workspace_id") or "")
-    path = editor_state_path(workspace_id)
-    if not path.exists():
-        emit({"action": "editor.status", "editor": None})
-        return
-    record = read_json(path)
-    pane_id = record.get("paneId")
-    record["running"] = isinstance(pane_id, str) and pane_exists(pane_id)
-    emit({"action": "editor.status", "editor": record})
+    if not workspace_id:
+        raise WorkbenchError("current Herdr workspace is unavailable")
+    with resource_lock(f"editor-{workspace_id}"):
+        path = editor_state_path(workspace_id)
+        if not path.exists():
+            emit({"action": "editor.status", "editor": None})
+            return
+        record = read_json(path)
+        pane_id, _server = _owned_editor_record(record, workspace_id)
+        if record.get("closedAt") and record.get("running") is False:
+            record["dirty"] = None
+            record["dirtyBuffers"] = None
+            record.pop("dirtyBufferCount", None)
+            record.pop("dirtyBuffersTruncated", None)
+            emit({"action": "editor.status", "editor": record})
+            return
+        pane_is_live = checked_pane_presence(pane_id)
+        record["running"] = pane_is_live
+        if pane_is_live is False:
+            record["stale"] = True
+        elif pane_is_live is True:
+            record.pop("stale", None)
+        _editor_dirty_fields(record, pane_is_live)
+        emit({"action": "editor.status", "editor": record})
 
 
-def editor_close(_args: argparse.Namespace) -> None:
-    context = require_herdr_context()
-    path = editor_state_path(str(context.get("workspace_id") or ""))
-    record = read_json(path)
-    pane_id = record.get("paneId")
-    if not isinstance(pane_id, str):
-        raise WorkbenchError("editor state has no pane ID")
-    if pane_exists(pane_id):
-        close_plugin_pane(pane_id)
+def _mark_editor_closed(path: Path, pane_id: str, *, stale: bool = False) -> None:
     with locked_json(path) as state:
         state["closedAt"] = now()
         state["running"] = False
-    emit({"action": "editor.close", "paneId": pane_id})
+        if stale:
+            state["stale"] = True
+            state["dirty"] = None
+            state["dirtyBuffers"] = None
+            state.pop("dirtyBufferCount", None)
+            state.pop("dirtyBuffersTruncated", None)
+        else:
+            state.pop("stale", None)
+            state.pop("dirty", None)
+            state.pop("dirtyBuffers", None)
+            state.pop("dirtyBufferCount", None)
+            state.pop("dirtyBuffersTruncated", None)
+
+
+def editor_close(args: argparse.Namespace) -> None:
+    context = require_herdr_context()
+    workspace_id = str(context.get("workspace_id") or "")
+    if not workspace_id:
+        raise WorkbenchError("current Herdr workspace is unavailable")
+    force = bool(getattr(args, "force", False))
+    with resource_lock(f"editor-{workspace_id}"):
+        path = editor_state_path(workspace_id)
+        if not path.exists():
+            # Closing an already absent editor is a safe no-op.  In particular,
+            # it must not claim that an unknown editor was clean.
+            emit({"action": "editor.close", "paneId": None, "closed": False})
+            return
+        record = read_json(path)
+        pane_id, server = _owned_editor_record(record, workspace_id)
+        if record.get("closedAt") and record.get("running") is False:
+            emit(
+                {
+                    "action": "editor.close",
+                    "paneId": pane_id,
+                    "closed": False,
+                    "alreadyClosed": True,
+                    "forced": force,
+                }
+            )
+            return
+        pane_is_live = checked_pane_presence(pane_id)
+        if pane_is_live is None:
+            raise WorkbenchError(
+                "could not determine whether the managed editor pane exists",
+                code="editor_pane_unknown",
+            )
+        if pane_is_live is False:
+            _mark_editor_closed(path, pane_id, stale=True)
+            emit(
+                {
+                    "action": "editor.close",
+                    "paneId": pane_id,
+                    "closed": False,
+                    "stale": True,
+                    "forced": force,
+                }
+            )
+            return
+
+        dirty: list[dict[str, Any]] = []
+        truncated = False
+        if not force:
+            if not isinstance(server, str):
+                raise WorkbenchError(
+                    "could not inspect modified Neovim buffers; refusing to close editor",
+                    code="editor_dirty_unknown",
+                    details={"dirtyBuffers": None},
+                )
+            try:
+                dirty, truncated = _query_modified_buffers(server)
+            except WorkbenchError as error:
+                raise WorkbenchError(
+                    "could not inspect modified Neovim buffers; refusing to close editor",
+                    code="editor_dirty_unknown",
+                    details={"dirtyBuffers": None},
+                ) from error
+            if dirty:
+                raise WorkbenchError(
+                    "refusing to close editor with modified buffers; use --force",
+                    code="editor_dirty",
+                    details={
+                        "dirtyBuffers": dirty,
+                        "dirtyBufferCount": len(dirty),
+                        "dirtyBuffersTruncated": truncated,
+                    },
+                )
+        try:
+            # The plugin-scoped Herdr operation is intentional: even a stale
+            # or forged pane ID cannot make this controller close an arbitrary
+            # non-plugin pane.
+            close_plugin_pane(pane_id)
+        except WorkbenchError as error:
+            if "pane_not_found" in str(error) or "plugin_pane_not_found" in str(error):
+                _mark_editor_closed(path, pane_id, stale=True)
+                emit(
+                    {
+                        "action": "editor.close",
+                        "paneId": pane_id,
+                        "closed": False,
+                        "stale": True,
+                        "forced": force,
+                    }
+                )
+                return
+            raise
+        _mark_editor_closed(path, pane_id)
+        emit(
+            {
+                "action": "editor.close",
+                "paneId": pane_id,
+                "closed": True,
+                "forced": force,
+                "dirtyBuffers": dirty if force is False else None,
+            }
+        )
 
 
 def internal_editor() -> None:
@@ -502,6 +814,7 @@ def job_start(args: argparse.Namespace) -> None:
     path = job_state_path(job_id)
     record = {
         "kind": "job",
+        "pluginId": PLUGIN_ID,
         "jobId": job_id,
         "workspaceId": context.get("workspace_id"),
         "paneId": None,
@@ -535,6 +848,100 @@ def job_start(args: argparse.Namespace) -> None:
     emit({"action": "job.start", "job": read_json(path)})
 
 
+def _record_job_process(
+    path: Path, process: subprocess.Popen[Any], *, process_group: bool = True
+) -> None:
+    process_group_id: int | None = None
+    if process_group:
+        try:
+            process_group_id = os.getpgid(process.pid)
+        except (OSError, ProcessLookupError):
+            process_group_id = None
+    with locked_json(path) as state:
+        state["processId"] = process.pid
+        state["processMode"] = "group" if process_group else "direct"
+        if process_group_id is not None:
+            state["processGroupId"] = process_group_id
+
+
+def _mark_job_cancelled(path: Path, *, reason: str | None = None) -> dict[str, Any]:
+    with locked_json(path) as state:
+        if state.get("status") in ACTIVE_JOB_STATUSES:
+            state["status"] = "cancelled"
+            state["completionRecorded"] = True
+            state["exitCode"] = 130
+            state["finishedAt"] = now()
+            if reason:
+                state["error"] = reason
+    return read_json(path)
+
+
+def _recorded_process_is_owned(record: dict[str, Any]) -> bool:
+    process_id = record.get("processId")
+    if (
+        not isinstance(process_id, int)
+        or isinstance(process_id, bool)
+        or process_id <= 1
+    ):
+        return False
+    process_mode = record.get("processMode")
+    if process_mode == "direct":
+        return True
+    process_group_id = record.get("processGroupId")
+    return (
+        isinstance(process_group_id, int)
+        and not isinstance(process_group_id, bool)
+        and process_group_id == process_id
+    )
+
+
+def stop_recorded_job_process(record: dict[str, Any]) -> bool:
+    """Stop only the process group created and recorded by this job."""
+    if not _recorded_process_is_owned(record):
+        return False
+    process_id = int(record["processId"])
+    process_mode = record.get("processMode")
+    process_group_id = (
+        int(record["processGroupId"])
+        if process_mode != "direct"
+        else None
+    )
+    try:
+        if process_group_id is None:
+            os.kill(process_id, signal.SIGTERM)
+        else:
+            os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except PermissionError as error:
+        raise WorkbenchError(
+            "could not terminate the recorded job process",
+            code="job_process_not_owned",
+        ) from error
+    deadline = time.monotonic() + JOB_KILL_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            os.kill(process_id, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            break
+        time.sleep(POLL_INTERVAL_SECONDS)
+    try:
+        if process_group_id is None:
+            os.kill(process_id, signal.SIGKILL)
+        else:
+            os.killpg(process_group_id, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    except PermissionError as error:
+        raise WorkbenchError(
+            "could not terminate the recorded job process",
+            code="job_process_not_owned",
+        ) from error
+    return True
+
+
 def internal_job() -> None:
     request_path = os.environ.get("WORKBENCH_REQUEST")
     if not request_path:
@@ -552,24 +959,36 @@ def internal_job() -> None:
             state["paneId"] = os.environ["HERDR_PANE_ID"]
     return_code = 1
     failure: str | None = None
+    global _CURRENT_JOB_STATE_PATH
+    previous_job_state_path = _CURRENT_JOB_STATE_PATH
+    _CURRENT_JOB_STATE_PATH = path
     try:
         if record.get("interactive"):
             return_code = run_interactive_job(command, str(record["cwd"]))
         else:
-            return_code = run_captured_job(command, str(record["cwd"]), Path(str(record["logFile"])))
+            return_code = run_captured_job(
+                command, str(record["cwd"]), Path(str(record["logFile"]))
+            )
     except KeyboardInterrupt:
         return_code = 130
     except Exception as error:
         failure = str(error)
+    finally:
+        _CURRENT_JOB_STATE_PATH = previous_job_state_path
     with locked_json(path) as state:
-        state["exitCode"] = return_code
-        state["status"] = (
-            "failed"
-            if failure
-            else "cancelled"
-            if return_code in {130, -2}
-            else "completed"
+        cancellation_requested = state.get("status") == "cancelling" or state.get(
+            "forceCloseRequested"
         )
+        completion_recorded = bool(state.get("completionRecorded"))
+        if not completion_recorded:
+            state["exitCode"] = return_code
+            state["status"] = (
+                "failed"
+                if failure and not cancellation_requested
+                else "cancelled"
+                if cancellation_requested or return_code in {130, -2, -9, -15}
+                else "completed"
+            )
         if failure:
             state["error"] = failure
         state["finishedAt"] = now()
@@ -589,7 +1008,9 @@ def mirror_output(chunk: bytes) -> None:
         sys.stdout.flush()
 
 
-def run_captured_job(command: list[str], cwd: str, log_path: Path) -> int:
+def run_captured_job(
+    command: list[str], cwd: str, log_path: Path, state_path: Path | None = None
+) -> int:
     log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     rotated_path = log_path.with_suffix(log_path.suffix + ".1")
     log = log_path.open("wb")
@@ -605,6 +1026,13 @@ def run_captured_job(command: list[str], cwd: str, log_path: Path) -> int:
             bufsize=0,
             start_new_session=True,
         )
+        process_state_path = state_path or _CURRENT_JOB_STATE_PATH
+        if process_state_path is not None:
+            try:
+                _record_job_process(process_state_path, process, process_group=True)
+            except (OSError, WorkbenchError):
+                stop_process(process, process_group=True)
+                raise
         assert process.stdout is not None
         try:
             with process.stdout:
@@ -628,8 +1056,17 @@ def run_captured_job(command: list[str], cwd: str, log_path: Path) -> int:
         log.close()
 
 
-def run_interactive_job(command: list[str], cwd: str) -> int:
+def run_interactive_job(
+    command: list[str], cwd: str, state_path: Path | None = None
+) -> int:
     process = subprocess.Popen(command, cwd=cwd)
+    process_state_path = state_path or _CURRENT_JOB_STATE_PATH
+    if process_state_path is not None:
+        try:
+            _record_job_process(process_state_path, process, process_group=False)
+        except (OSError, WorkbenchError):
+            stop_process(process)
+            raise
     try:
         return process.wait()
     except KeyboardInterrupt:
@@ -700,22 +1137,94 @@ def find_job(job_id: str) -> tuple[Path, dict[str, Any]]:
     return path, read_json(path)
 
 
-def job_status(args: argparse.Namespace) -> None:
-    path, record = find_job(args.job_id)
+def _owned_job_record(job_id: str, record: dict[str, Any]) -> str:
+    if record.get("pluginId") not in {None, PLUGIN_ID}:
+        raise WorkbenchError(
+            "job state belongs to another plugin",
+            code="job_not_owned",
+        )
+    recorded_job_id = record.get("jobId")
+    if recorded_job_id is not None and recorded_job_id != job_id:
+        raise WorkbenchError(
+            "job state does not match the requested job",
+            code="job_not_owned",
+        )
+    kind = record.get("kind")
+    if kind is not None and kind != "job":
+        raise WorkbenchError(
+            "job state does not belong to a managed job",
+            code="job_not_owned",
+        )
     pane_id = record.get("paneId")
-    pane_is_live = pane_presence(pane_id) if isinstance(pane_id, str) else False
-    if pane_is_live is False and record.get("status") in {"starting", "running", "cancelling"}:
-        with locked_json(path) as state:
-            if state.get("status") == "cancelling":
-                state["status"] = "cancelled"
-                state["exitCode"] = 130
-            elif state.get("status") in {"starting", "running"}:
-                state["status"] = "failed"
-                state["error"] = "job pane exited before reporting completion"
-            state["finishedAt"] = now()
+    if not isinstance(pane_id, str) or not pane_id:
+        raise WorkbenchError("job state has no pane ID", code="job_state_invalid")
+    workspace_id = record.get("workspaceId")
+    if (
+        isinstance(workspace_id, str)
+        and ":" in pane_id
+        and not pane_id.startswith(f"{workspace_id}:")
+    ):
+        raise WorkbenchError(
+            "job pane belongs to another Herdr workspace",
+            code="job_not_owned",
+        )
+    return pane_id
+
+
+def _request_job_cancellation(path: Path) -> bool:
+    with locked_json(path) as state:
+        if state.get("status") not in ACTIVE_JOB_STATUSES:
+            return False
+        state["status"] = "cancelling"
+        state.setdefault("cancelRequestedAt", now())
+        state["forceCloseRequested"] = True
+        state["forceCloseRequestedAt"] = now()
+        return True
+
+
+def _wait_for_job_terminal(path: Path, pane_id: str) -> dict[str, Any] | None:
+    deadline = time.monotonic() + JOB_CLOSE_TIMEOUT_SECONDS
+    while True:
         record = read_json(path)
-    record["paneExists"] = pane_is_live
-    emit({"action": "job.status", "job": record})
+        if record.get("status") in TERMINAL_JOB_STATUSES:
+            return record
+        pane_is_live = checked_pane_presence(pane_id)
+        if pane_is_live is False:
+            stop_recorded_job_process(record)
+            return _mark_job_cancelled(
+                path, reason="job pane exited while cancellation was requested"
+            )
+        if pane_is_live is None:
+            return None
+        if time.monotonic() >= deadline:
+            return record
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+
+def job_status(args: argparse.Namespace) -> None:
+    with resource_lock(f"job-{args.job_id}"):
+        path, record = find_job(args.job_id)
+        pane_id = _owned_job_record(args.job_id, record)
+        pane_is_live = checked_pane_presence(pane_id)
+        if pane_is_live is False and record.get("status") in ACTIVE_JOB_STATUSES:
+            # A controller can disappear with its child still alive.  The
+            # process identity was recorded by the controller, so clean up
+            # only that group.
+            stop_recorded_job_process(record)
+            with locked_json(path) as state:
+                if state.get("status") == "cancelling" or state.get("forceCloseRequested"):
+                    state["status"] = "cancelled"
+                    state["completionRecorded"] = True
+                    state["exitCode"] = 130
+                elif state.get("status") in {"starting", "running"}:
+                    state["status"] = "failed"
+                    state["completionRecorded"] = True
+                    state["exitCode"] = 1
+                    state["error"] = "job pane exited before reporting completion"
+                state["finishedAt"] = now()
+            record = read_json(path)
+        record["paneExists"] = pane_is_live
+        emit({"action": "job.status", "job": record})
 
 
 def job_list(_args: argparse.Namespace) -> None:
@@ -732,7 +1241,7 @@ def job_list(_args: argparse.Namespace) -> None:
 
 def job_read(args: argparse.Namespace) -> None:
     _path, record = find_job(args.job_id)
-    pane_id = record.get("paneId")
+    pane_id = _owned_job_record(args.job_id, record)
     log_file = record.get("logFile")
     if isinstance(log_file, str) and Path(log_file).exists():
         output = tail_log(Path(log_file), args.lines)
@@ -756,43 +1265,124 @@ def job_read(args: argparse.Namespace) -> None:
 
 
 def job_cancel(args: argparse.Namespace) -> None:
-    path, record = find_job(args.job_id)
-    if record.get("status") not in {"starting", "running"}:
-        raise WorkbenchError(f"job is not running: {args.job_id}")
-    pane_id = record.get("paneId")
-    if not isinstance(pane_id, str) or not pane_exists(pane_id):
-        raise WorkbenchError(f"job pane is not available: {args.job_id}")
-    with locked_json(path) as state:
-        if state.get("status") not in {"starting", "running"}:
+    with resource_lock(f"job-{args.job_id}"):
+        path, record = find_job(args.job_id)
+        pane_id = _owned_job_record(args.job_id, record)
+        if record.get("status") not in {"starting", "running"}:
             raise WorkbenchError(f"job is not running: {args.job_id}")
-        previous_status = str(state["status"])
-        state["status"] = "cancelling"
-        state["cancelRequestedAt"] = now()
-    try:
-        herdr("pane", "send-keys", pane_id, "ctrl+c")
-    except WorkbenchError:
+        if not pane_exists(pane_id):
+            raise WorkbenchError(f"job pane is not available: {args.job_id}")
         with locked_json(path) as state:
-            if state.get("status") == "cancelling":
-                state["status"] = previous_status
-                state.pop("cancelRequestedAt", None)
-        raise
-    emit({"action": "job.cancel", "job": read_json(path)})
+            if state.get("status") not in {"starting", "running"}:
+                raise WorkbenchError(f"job is not running: {args.job_id}")
+            previous_status = str(state["status"])
+            state["status"] = "cancelling"
+            state["cancelRequestedAt"] = now()
+        try:
+            herdr("pane", "send-keys", pane_id, "ctrl+c")
+        except WorkbenchError:
+            with locked_json(path) as state:
+                if state.get("status") == "cancelling":
+                    state["status"] = previous_status
+                    state.pop("cancelRequestedAt", None)
+            raise
+        emit({"action": "job.cancel", "job": read_json(path)})
 
 
 def job_close(args: argparse.Namespace) -> None:
-    path, record = find_job(args.job_id)
-    pane_id = record.get("paneId")
-    if not isinstance(pane_id, str):
-        raise WorkbenchError("job state has no pane ID")
-    if record.get("status") in {"starting", "running", "cancelling"} and not args.force:
-        raise WorkbenchError("refusing to close a running job without --force")
-    if pane_exists(pane_id):
-        if args.force and record.get("status") in {"starting", "running", "cancelling"}:
-            herdr("pane", "send-keys", pane_id, "ctrl+c")
-        close_plugin_pane(pane_id)
-    with locked_json(path) as state:
-        state["paneClosedAt"] = now()
-    emit({"action": "job.close", "jobId": args.job_id, "paneId": pane_id})
+    force = bool(getattr(args, "force", False))
+    with resource_lock(f"job-{args.job_id}"):
+        path, record = find_job(args.job_id)
+        pane_id = _owned_job_record(args.job_id, record)
+        status = record.get("status")
+        if record.get("paneClosedAt") and status not in ACTIVE_JOB_STATUSES:
+            emit(
+                {
+                    "action": "job.close",
+                    "jobId": args.job_id,
+                    "paneId": pane_id,
+                    "closed": False,
+                    "alreadyClosed": True,
+                    "forced": force,
+                }
+            )
+            return
+        if status in ACTIVE_JOB_STATUSES and not force:
+            raise WorkbenchError("refusing to close a running job without --force")
+
+        pane_is_live = checked_pane_presence(pane_id)
+        if pane_is_live is None:
+            raise WorkbenchError(
+                f"could not determine whether job pane exists: {args.job_id}",
+                code="job_pane_unknown",
+            )
+
+        if status in ACTIVE_JOB_STATUSES and force:
+            if pane_is_live:
+                _request_job_cancellation(path)
+                cancellation_error: WorkbenchError | None = None
+                try:
+                    herdr("pane", "send-keys", pane_id, "ctrl+c")
+                except WorkbenchError as error:
+                    cancellation_error = error
+                _wait_for_job_terminal(path, pane_id)
+                current = read_json(path)
+                if current.get("status") not in TERMINAL_JOB_STATUSES:
+                    # Ctrl-C normally reaches the controller.  If it did not,
+                    # terminate only the process group this job recorded.
+                    stopped = stop_recorded_job_process(current)
+                    if stopped:
+                        _mark_job_cancelled(
+                            path, reason="job was force-closed before it reported completion"
+                        )
+                    else:
+                        if cancellation_error is not None:
+                            raise cancellation_error
+                        # Older records may not have process identity fields.
+                        # The bounded wait plus an explicit --force request is
+                        # the safest available cleanup for those records.
+                        _mark_job_cancelled(
+                            path, reason="job was force-closed before it reported completion"
+                        )
+            else:
+                # The pane is already gone.  Reconcile the active record, but
+                # never issue a close or key event for an unknown pane.
+                stop_recorded_job_process(record)
+                _mark_job_cancelled(
+                    path, reason="job pane was already gone during force close"
+                )
+
+        record = read_json(path)
+        if record.get("status") in ACTIVE_JOB_STATUSES:
+            raise WorkbenchError(
+                "refusing to close job before cancellation completed",
+                code="job_cancellation_timeout",
+            )
+        pane_is_live = checked_pane_presence(pane_id)
+        if pane_is_live is None:
+            raise WorkbenchError(
+                f"could not determine whether job pane exists: {args.job_id}",
+                code="job_pane_unknown",
+            )
+        if pane_is_live:
+            try:
+                # As with editor close, this is deliberately plugin-scoped and
+                # operates only on the pane recorded for this job.
+                close_plugin_pane(pane_id)
+            except WorkbenchError as error:
+                if "pane_not_found" not in str(error) and "plugin_pane_not_found" not in str(error):
+                    raise
+        with locked_json(path) as state:
+            state["paneClosedAt"] = now()
+            if force:
+                state["forceClosed"] = True
+        emit({
+            "action": "job.close",
+            "jobId": args.job_id,
+            "paneId": pane_id,
+            "forced": force,
+            "status": record.get("status"),
+        })
 
 
 def lazygit_state_path(workspace_id: str) -> Path:
@@ -933,7 +1523,9 @@ def parser() -> argparse.ArgumentParser:
     add_placement(editor_open_parser)
     editor_open_parser.set_defaults(handler=editor_open)
     editor_commands.add_parser("status").set_defaults(handler=editor_status)
-    editor_commands.add_parser("close").set_defaults(handler=editor_close)
+    editor_close_parser = editor_commands.add_parser("close")
+    editor_close_parser.add_argument("--force", action="store_true")
+    editor_close_parser.set_defaults(handler=editor_close)
 
     job = commands.add_parser("job")
     job_commands = job.add_subparsers(dest="job_action", required=True)
@@ -989,7 +1581,7 @@ def main() -> None:
         args = parser().parse_args()
         args.handler(args)
     except WorkbenchError as error:
-        fail(str(error))
+        fail(str(error), code=error.code, details=error.details)
 
 
 if __name__ == "__main__":

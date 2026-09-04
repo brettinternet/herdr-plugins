@@ -42,6 +42,15 @@ Open or reveal code:
 
 Use `--focus` when the user asks to show, reveal, switch to, or watch the file. Otherwise preserve focus with `--no-focus`. A workspace has one managed editor; later opens reuse it through Neovim RPC.
 
+Inspect or close the editor explicitly:
+
+```sh
+"$workbench" editor status
+"$workbench" editor close
+```
+
+`editor close` refuses modified Neovim buffers. Use `editor close --force` only when the user explicitly asks to discard unsaved changes.
+
 Start an ordinary visible job:
 
 ```sh
@@ -77,8 +86,9 @@ Focus a returned pane:
 
 - Default to `--no-focus`; focus only when requested or necessary for direct interaction.
 - Close only editor, LazyGit, or job resources returned by this plugin.
+- `editor close` refuses modified Neovim buffers; use `editor close --force` only when the user explicitly asks to discard unsaved changes.
 - `job cancel` sends Ctrl-C only to the recorded owned pane.
-- Do not use `job close --force` unless the user explicitly asks to terminate and close running work.
+- Do not use `job close --force` unless the user explicitly asks to terminate and close running work; forced close waits for cancellation and cleans up only the recorded job process group.
 - Do not use raw key injection to control Neovim or LazyGit internals.
 - Starting a command does not imply permission for unrelated destructive actions.
 - Report the observed JSON state: created versus reused, pane ID, job ID, status, and exit code.
