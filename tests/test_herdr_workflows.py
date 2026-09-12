@@ -65,13 +65,57 @@ class LastWorkspaceTest(unittest.TestCase):
 
             with (
                 mock.patch.dict(os.environ, environment, clear=True),
-                mock.patch.object(last_workspace, "focused_workspace", return_value="w2"),
+                mock.patch.object(
+                    last_workspace,
+                    "workspace_state",
+                    return_value=("w2", {"w1", "w2"}),
+                ),
                 mock.patch.object(last_workspace.subprocess, "run") as run,
                 mock.patch.object(last_workspace.sys, "argv", ["workspace.py", "toggle"]),
             ):
                 last_workspace.main()
 
             self.assertEqual(run.call_args.args[0], ["herdr", "workspace", "focus", "w1"])
+
+    def test_watcher_tracks_ui_focus_changes_that_emit_no_event(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            states = [
+                ("w1", {"w1", "w2"}),
+                ("w2", {"w1", "w2"}),
+                OSError("server stopped"),
+            ]
+
+            with (
+                mock.patch.object(last_workspace, "workspace_state", side_effect=states),
+                mock.patch.object(last_workspace.time, "sleep"),
+            ):
+                last_workspace.watch(state_dir)
+
+            self.assertEqual((state_dir / "current").read_text(), "w2\n")
+            self.assertEqual((state_dir / "previous").read_text(), "w1\n")
+
+    def test_toggle_does_not_focus_a_closed_workspace(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            last_workspace.record(state_dir, "closed")
+            last_workspace.record(state_dir, "w2")
+            environment = {"HERDR_PLUGIN_STATE_DIR": temporary}
+
+            with (
+                mock.patch.dict(os.environ, environment, clear=True),
+                mock.patch.object(
+                    last_workspace,
+                    "workspace_state",
+                    return_value=("w2", {"w2"}),
+                ),
+                mock.patch.object(last_workspace.subprocess, "run") as run,
+                mock.patch.object(last_workspace.sys, "argv", ["workspace.py", "toggle"]),
+            ):
+                last_workspace.main()
+
+            run.assert_not_called()
+            self.assertEqual((state_dir / "previous").read_text(), "")
 
 
 class PaneTitleTest(unittest.TestCase):
