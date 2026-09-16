@@ -46,6 +46,32 @@ with mock.patch.dict(sys.modules, {"sync": pane_title}):
 
 
 class LastWorkspaceTest(unittest.TestCase):
+    def test_state_is_scoped_to_the_herdr_session(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "HERDR_PLUGIN_STATE_DIR": temporary,
+                    "HERDR_SOCKET_PATH": "/tmp/herdr/sessions/first/herdr.sock",
+                },
+                clear=True,
+            ):
+                first = last_workspace.session_state_dir()
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "HERDR_PLUGIN_STATE_DIR": temporary,
+                    "HERDR_SOCKET_PATH": "/tmp/herdr/sessions/second/herdr.sock",
+                },
+                clear=True,
+            ):
+                second = last_workspace.session_state_dir()
+
+            self.assertEqual(first.parent, Path(temporary))
+            self.assertEqual(second.parent, Path(temporary))
+            self.assertNotEqual(first, second)
+
     def test_record_tracks_only_workspace_changes(self):
         with tempfile.TemporaryDirectory() as temporary:
             state_dir = Path(temporary)

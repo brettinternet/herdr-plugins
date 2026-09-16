@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import fcntl
+import hashlib
 import json
 import os
 import socket
@@ -11,6 +12,15 @@ import uuid
 from pathlib import Path
 
 POLL_INTERVAL_SECONDS = 0.1
+
+
+def session_state_dir() -> Path:
+    state_dir = Path(os.environ["HERDR_PLUGIN_STATE_DIR"])
+    socket_path = os.environ.get("HERDR_SOCKET_PATH")
+    if not socket_path:
+        return state_dir
+    session_id = hashlib.sha256(socket_path.encode()).hexdigest()[:16]
+    return state_dir / session_id
 
 
 def workspace_state() -> tuple[str, set[str]]:
@@ -103,7 +113,7 @@ def main() -> None:
     if len(sys.argv) != 2 or sys.argv[1] not in {"record", "toggle", "watch"}:
         raise SystemExit("usage: workspace.py record|toggle|watch")
 
-    state_dir = Path(os.environ["HERDR_PLUGIN_STATE_DIR"])
+    state_dir = session_state_dir()
     state_dir.mkdir(parents=True, exist_ok=True)
     if sys.argv[1] == "watch":
         watch(state_dir)
