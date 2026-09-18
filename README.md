@@ -1,6 +1,6 @@
 # Herdr plugins
 
-Ten independent plugins for [Herdr](https://herdr.dev), a terminal workspace manager. Each plugin directory contains its own manifest and runtime files.
+Eleven independent plugins for [Herdr](https://herdr.dev), a terminal workspace manager. Each plugin directory contains its own manifest and runtime files.
 
 ## Prerequisites
 
@@ -8,11 +8,13 @@ All plugins support Linux and macOS and require a POSIX shell. Requirements vary
 
 | Requirement | Plugins |
 | --- | --- |
+| Herdr 0.9.0+ | `worktrunk` |
 | Herdr 0.8.2+ | `pane-title`, `workbench` |
 | Herdr 0.8.0+ | All others |
-| Python 3.10+ | `command-palette`, `last-workspace`, `pane-collapse`, `pane-equalize`, `pane-rotate`, `pane-title`, `workbench` |
+| Python 3.10+ | `command-palette`, `last-workspace`, `pane-collapse`, `pane-equalize`, `pane-rotate`, `pane-title`, `workbench`, `worktrunk` |
 | `jq` | `command-palette`, `previous-pane-focus`, `seamless-navigation`, `window-title` |
 | `fzf` | `command-palette` |
+| Worktrunk | `worktrunk` |
 | Neovim | `workbench` editor commands |
 | LazyGit | `workbench` LazyGit commands |
 | tmux or tmate | Optional seamless-navigation integration |
@@ -35,6 +37,7 @@ Install each plugin independently with Herdr's native GitHub installer:
 | `seamless-navigation` | Navigate and resize panes through Vim and tmux | `herdr plugin install brettinternet/herdr-plugins/seamless-navigation --yes` |
 | `window-title` | Mirror the focused pane title to the terminal | `herdr plugin install brettinternet/herdr-plugins/window-title --yes` |
 | `workbench` | Let agents open managed editors and Git UIs and run observable foreground jobs | `herdr plugin install brettinternet/herdr-plugins/workbench --yes` |
+| `worktrunk` | Create, open, focus, and safely remove Worktrunk worktrees | `herdr plugin install brettinternet/herdr-plugins/worktrunk --yes` |
 
 ## Local development
 

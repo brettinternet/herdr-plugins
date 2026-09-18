@@ -1,0 +1,34 @@
+id = "brettinternet.worktrunk"
+name = "Worktrunk worktrees"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Create, open, focus, and remove Worktrunk worktrees"
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "open"
+title = "Open Worktrunk worktree picker"
+contexts = ["workspace"]
+command = ["sh", "open-picker.sh"]
+
+[[actions]]
+id = "create"
+title = "Create Worktrunk worktree"
+contexts = ["workspace"]
+command = ["sh", "open-create.sh"]
+
+[[panes]]
+id = "picker"
+title = "Worktrunk worktrees"
+placement = "popup"
+width = 110
+height = 28
+command = ["python3", "picker.py"]
+
+[[panes]]
+id = "create"
+title = "Create worktree"
+placement = "popup"
+width = 72
+height = 12
+command = ["python3", "create.py"]
