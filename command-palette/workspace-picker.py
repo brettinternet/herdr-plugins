@@ -5,11 +5,19 @@ import os
 import re
 import shlex
 import shutil
-import socket
 import subprocess
 import sys
 import unicodedata
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from common import send_herdr_request
+
+
+def herdr_request(method: str, params: dict) -> dict:
+    return send_herdr_request("workspace-picker", method, params)
+
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -21,29 +29,6 @@ MAGENTA = "\033[35m"
 RED = "\033[31m"
 GRAY = "\033[90m"
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-
-
-def herdr_request(method: str, params: dict) -> dict:
-    socket_path = os.environ.get("HERDR_SOCKET_PATH")
-    if not socket_path:
-        raise RuntimeError("HERDR_SOCKET_PATH is not set")
-    payload = json.dumps({"id": "workspace-picker", "method": method, "params": params})
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-        client.connect(socket_path)
-        client.sendall(payload.encode() + b"\n")
-        response = b""
-        while b"\n" not in response:
-            chunk = client.recv(65536)
-            if not chunk:
-                break
-            response += chunk
-    if not response:
-        raise RuntimeError(f"Herdr returned no response for {method}")
-    decoded = json.loads(response.splitlines()[0])
-    if "error" in decoded:
-        error = decoded["error"]
-        raise RuntimeError(error.get("message") or error.get("code") or str(error))
-    return decoded["result"]
 
 
 STATUS_STYLES = {
