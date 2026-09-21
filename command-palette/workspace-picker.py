@@ -415,17 +415,17 @@ def pick_workspace() -> None:
 
 
 def main() -> None:
-    if len(sys.argv) == 4 and sys.argv[1] == "preview":
-        print(workspace_preview(snapshot(), sys.argv[3], sys.argv[2]))
-        return
-    if len(sys.argv) == 4 and sys.argv[1] == "rows-panes":
-        print(pane_rows(snapshot(), sys.argv[2], sys.argv[3]))
-        return
-    if len(sys.argv) == 2 and sys.argv[1] == "rows-workspaces":
-        print(workspace_rows(snapshot()))
-        return
-    if len(sys.argv) == 4 and sys.argv[1] == "cycle":
-        cycle_preview_pane(sys.argv[2], int(sys.argv[3]))
+    handlers = {
+        ("preview", 4): lambda: print(workspace_preview(snapshot(), sys.argv[3], sys.argv[2])),
+        ("rows-panes", 4): lambda: print(pane_rows(snapshot(), sys.argv[2], sys.argv[3])),
+        ("rows-workspaces", 2): lambda: print(workspace_rows(snapshot())),
+        ("cycle", 4): lambda: cycle_preview_pane(sys.argv[2], int(sys.argv[3])),
+    }
+    command = sys.argv[1] if len(sys.argv) > 1 else None
+    argc = len(sys.argv)
+    handler = handlers.get((command, argc))
+    if handler is not None:
+        handler()
         return
     if len(sys.argv) != 1:
         raise SystemExit(
