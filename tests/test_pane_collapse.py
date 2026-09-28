@@ -84,6 +84,15 @@ class PaneCollapseTest(unittest.TestCase):
 
         self.assertEqual(calls[-1][1]["ratio"], 0.9)
 
+    def test_finds_parent_split_for_nested_pane(self):
+        nested = split(pane("w1:p2"), pane("w1:p3"), direction="down")
+        root = split(pane("w1:p1"), nested)
+
+        self.assertEqual(
+            pane_collapse.find_parent_split(root, "w1:p3"),
+            ([True], "second", nested),
+        )
+
     def test_restores_exact_ratio_while_ignoring_collapsed_ratio(self):
         original = {
             "tab_id": "w1:t1",
