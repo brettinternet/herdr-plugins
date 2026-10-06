@@ -35,12 +35,6 @@ def request(method: str, params: dict[str, Any]) -> dict[str, Any]:
     return decoded["result"]
 
 
-def pane_ids(node: dict[str, Any]) -> list[str]:
-    if node["type"] == "pane":
-        return [node["pane_id"]]
-    return pane_ids(node["first"]) + pane_ids(node["second"])
-
-
 def split_signature(node: dict[str, Any]) -> dict[str, Any]:
     """Describe split structure and membership without ratios or orientation."""
     if node["type"] == "pane":
@@ -59,15 +53,15 @@ def find_parent_split(
     if node["type"] != "split":
         return None
 
-    if pane_id in pane_ids(node["first"]):
-        if node["first"]["type"] == "pane" and node["first"]["pane_id"] == pane_id:
-            return path, "first", node
-        return find_parent_split(node["first"], pane_id, path + [False])
-
-    if pane_id in pane_ids(node["second"]):
-        if node["second"]["type"] == "pane" and node["second"]["pane_id"] == pane_id:
-            return path, "second", node
-        return find_parent_split(node["second"], pane_id, path + [True])
+    for branch, side in (("first", False), ("second", True)):
+        child = node[branch]
+        if child["type"] == "pane":
+            if child["pane_id"] == pane_id:
+                return path, branch, node
+        else:
+            found = find_parent_split(child, pane_id, path + [side])
+            if found is not None:
+                return found
 
     return None
 
