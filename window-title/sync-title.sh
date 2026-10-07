@@ -1,7 +1,8 @@
 #!/bin/sh
 set -eu
 
-snapshot="$(herdr api snapshot)"
+herdr_bin=${HERDR_BIN_PATH:-herdr}
+snapshot="$("$herdr_bin" api snapshot)"
 title="$(printf '%s\n' "$snapshot" | jq -r '
   .result.snapshot as $snapshot
   | $snapshot.panes[]
@@ -10,7 +11,7 @@ title="$(printf '%s\n' "$snapshot" | jq -r '
 ')"
 
 if [ -n "$title" ]; then
-  herdr terminal title set "$title" >/dev/null
+  "$herdr_bin" terminal title set "$title" >/dev/null
 else
-  herdr terminal title clear >/dev/null
+  "$herdr_bin" terminal title clear >/dev/null
 fi

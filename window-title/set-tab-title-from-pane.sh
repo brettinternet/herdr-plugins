@@ -1,7 +1,8 @@
 #!/bin/sh
 set -eu
 
-snapshot="$(herdr api snapshot)"
+herdr_bin=${HERDR_BIN_PATH:-herdr}
+snapshot="$("$herdr_bin" api snapshot)"
 tab_id="$(printf '%s\n' "$snapshot" | jq -r '
   .result.snapshot as $snapshot
   | $snapshot.panes[]
@@ -22,4 +23,4 @@ if [ -z "$title" ]; then
   exit 1
 fi
 
-herdr tab rename "$tab_id" "$title" >/dev/null
+"$herdr_bin" tab rename "$tab_id" "$title" >/dev/null

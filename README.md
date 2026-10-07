@@ -11,7 +11,7 @@ All plugins support Linux and macOS and require a POSIX shell. Requirements vary
 | Herdr 0.9.0+ | `worktrunk` |
 | Herdr 0.8.2+ | `pane-title`, `workbench` |
 | Herdr 0.8.0+ | All others |
-| Python 3.10+ | `command-palette`, `last-workspace`, `pane-collapse`, `pane-equalize`, `pane-rotate`, `pane-title`, `workbench`, `worktrunk` |
+| Python 3.9+ (macOS system `python3` works) | `command-palette`, `last-workspace`, `pane-collapse`, `pane-equalize`, `pane-rotate`, `pane-title`, `workbench`, `worktrunk` |
 | `jq` | `command-palette`, `previous-pane-focus`, `seamless-navigation`, `window-title` |
 | `fzf` | `command-palette` |
 | Worktrunk | `worktrunk` |

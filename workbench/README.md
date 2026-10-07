@@ -4,7 +4,7 @@
 
 ## Prerequisites
 
-- Linux or macOS, Herdr 0.8.2+, a POSIX shell, and Python 3.10+.
+- Linux or macOS, Herdr 0.8.2+, a POSIX shell, and Python 3.9+.
 - Neovim for editor commands and LazyGit for LazyGit commands.
 - `jq` for the setup examples and bundled agent skill.
 

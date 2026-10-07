@@ -10,9 +10,19 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # 3.9 is macOS's system python3, which Herdr plugins get when the
+        # server starts without a user PATH (for example over SSH).
+        python-version: ["3.9", "3.x"]
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
 
       - name: Run Python unit tests
         run: find . -type f -name 'test_*.py' -print0 | xargs -0 -n1 python3
