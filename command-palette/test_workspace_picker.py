@@ -16,6 +16,12 @@ SPEC.loader.exec_module(workspace_picker)
 
 
 class WorkspacePickerTest(unittest.TestCase):
+    def test_truncate_ansi_line_keeps_wide_characters_within_width(self) -> None:
+        self.assertEqual(
+            workspace_picker.truncate_ansi_line("A界B", 3),
+            "A界" + workspace_picker.RESET,
+        )
+
     def test_entering_pane_mode_starts_at_current_preview_pane(self) -> None:
         state = {
             "workspaces": [{"workspace_id": "w1", "active_tab_id": "t2"}],

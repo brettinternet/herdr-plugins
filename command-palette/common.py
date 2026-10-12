@@ -5,6 +5,15 @@ from __future__ import annotations
 import json
 import os
 import socket
+import unicodedata
+
+
+def character_width(character: str) -> int:
+    if unicodedata.combining(character):
+        return 0
+    if unicodedata.category(character).startswith("C"):
+        return 0
+    return 2 if unicodedata.east_asian_width(character) in {"W", "F"} else 1
 
 
 def send_herdr_request(request_id: str, method: str, params: dict) -> dict:

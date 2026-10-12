@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from common import send_herdr_request
+from common import character_width, send_herdr_request
 
 
 def herdr_request(method: str, params: dict) -> dict:
@@ -74,14 +74,6 @@ class Grid:
     card_width: int
     card_height: int
     capacity: int
-
-
-def character_width(character: str) -> int:
-    if unicodedata.combining(character):
-        return 0
-    if unicodedata.category(character).startswith("C"):
-        return 0
-    return 2 if unicodedata.east_asian_width(character) in {"W", "F"} else 1
 
 
 def display_width(text: str) -> int:
