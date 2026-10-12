@@ -9,12 +9,11 @@ import shlex
 import shutil
 import subprocess
 import sys
-import unicodedata
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from common import send_herdr_request
+from common import character_width, send_herdr_request
 
 
 def herdr_request(method: str, params: dict) -> dict:
@@ -60,14 +59,6 @@ def preview_columns() -> int:
         return max(20, int(os.environ.get("FZF_PREVIEW_COLUMNS", "80")) - 1)
     except ValueError:
         return 79
-
-
-def character_width(character: str) -> int:
-    if unicodedata.combining(character):
-        return 0
-    if unicodedata.category(character).startswith("C"):
-        return 0
-    return 2 if unicodedata.east_asian_width(character) in {"W", "F"} else 1
 
 
 def truncate_ansi_line(line: str, width: int) -> str:

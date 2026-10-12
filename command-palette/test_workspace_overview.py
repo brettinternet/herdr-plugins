@@ -14,6 +14,9 @@ SPEC.loader.exec_module(workspace_overview)
 
 
 class WorkspaceOverviewTest(unittest.TestCase):
+    def test_display_width_handles_wide_and_combining_characters(self) -> None:
+        self.assertEqual(workspace_overview.display_width("A界e\u0301"), 4)
+
     def test_six_panes_use_three_by_two_grid_at_popup_size(self) -> None:
         grid = workspace_overview.calculate_grid(140, 60, 6)
 
