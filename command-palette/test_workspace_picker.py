@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -21,6 +22,16 @@ class WorkspacePickerTest(unittest.TestCase):
             workspace_picker.truncate_ansi_line("A界B", 3),
             "A界" + workspace_picker.RESET,
         )
+
+    def test_preview_index_read_handles_missing_invalid_and_valid_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "preview.index"
+
+            self.assertIsNone(workspace_picker._read_preview_index(path))
+            path.write_text("invalid\n")
+            self.assertIsNone(workspace_picker._read_preview_index(path))
+            path.write_text("3\n")
+            self.assertEqual(workspace_picker._read_preview_index(path), 3)
 
     def test_entering_pane_mode_starts_at_current_preview_pane(self) -> None:
         state = {
