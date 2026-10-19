@@ -113,6 +113,13 @@ def preview_index_path(workspace_id: str) -> Path | None:
     return directory / f"workspace-preview-{safe_id}.index"
 
 
+def _read_preview_index(path: Path) -> int | None:
+    try:
+        return int(path.read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
 
 def selected_preview_index(workspace_id: str, pane_count: int, default: int) -> int:
     if pane_count == 0:
@@ -120,9 +127,8 @@ def selected_preview_index(workspace_id: str, pane_count: int, default: int) -> 
     path = preview_index_path(workspace_id)
     if path is None:
         return default % pane_count
-    try:
-        selected = int(path.read_text().strip())
-    except (FileNotFoundError, ValueError):
+    selected = _read_preview_index(path)
+    if selected is None:
         selected = default
         path.write_text(f"{selected}\n")
     return selected % pane_count
@@ -132,9 +138,8 @@ def cycle_preview_pane(workspace_id: str, delta: int) -> None:
     path = preview_index_path(workspace_id)
     if path is None:
         return
-    try:
-        selected = int(path.read_text().strip())
-    except (FileNotFoundError, ValueError):
+    selected = _read_preview_index(path)
+    if selected is None:
         selected = 0
     path.write_text(f"{selected + delta}\n")
 
