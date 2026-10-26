@@ -285,7 +285,6 @@ def workspace_preview(state: dict, workspace_id: str, target_id: str | None = No
         (item for item in state.get("tabs", []) if item["workspace_id"] == workspace_id),
         key=lambda item: item["number"],
     )
-    panes = [item for item in state.get("panes", []) if item["workspace_id"] == workspace_id]
     ordered_panes = ordered_workspace_panes(state, workspace_id)
     default_pane = default_workspace_pane_index(state, workspace_id, ordered_panes)
     pane_index = next(
@@ -305,10 +304,7 @@ def workspace_preview(state: dict, workspace_id: str, target_id: str | None = No
             f"{clean(tab.get('label') or tab['tab_id'])}  "
             f"{status_label(tab.get('agent_status'))}"
         )
-        tab_panes = sorted(
-            (item for item in panes if item["tab_id"] == tab["tab_id"]),
-            key=lambda item: item["pane_id"],
-        )
+        tab_panes = [pane for pane in ordered_panes if pane["tab_id"] == tab["tab_id"]]
         trunk = "   " if tab_last else "│  "
         for tab_pane_index, pane in enumerate(tab_panes):
             pane_branch = "└─" if tab_pane_index == len(tab_panes) - 1 else "├─"
