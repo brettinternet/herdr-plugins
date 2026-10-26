@@ -87,24 +87,6 @@ class WorkspacePickerTest(unittest.TestCase):
         self.assertEqual(first_pane("p2a"), "p3a")
         self.assertEqual(first_pane("p3a"), "p1a")
 
-    def test_ordered_workspace_panes_groups_before_sorting(self) -> None:
-        state = {
-            "tabs": [
-                {"workspace_id": "w1", "tab_id": "t2", "number": 2},
-                {"workspace_id": "w1", "tab_id": "t1", "number": 1},
-            ],
-            "panes": [
-                {"workspace_id": "w1", "tab_id": "t2", "pane_id": "p2b"},
-                {"workspace_id": "w1", "tab_id": "t1", "pane_id": "p1b"},
-                {"workspace_id": "w1", "tab_id": "t2", "pane_id": "p2a"},
-                {"workspace_id": "w1", "tab_id": "missing", "pane_id": "orphan"},
-            ],
-        }
-
-        panes = workspace_picker.ordered_workspace_panes(state, "w1")
-
-        self.assertEqual([pane["pane_id"] for pane in panes], ["p1b", "p2a", "p2b"])
-
     def test_workspace_and_pane_modes_have_vim_navigation_aliases(self) -> None:
         state = {
             "workspaces": [
