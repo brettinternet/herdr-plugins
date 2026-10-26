@@ -157,14 +157,14 @@ def ordered_workspace_panes(state: dict, workspace_id: str) -> list[dict]:
         (item for item in state.get("tabs", []) if item["workspace_id"] == workspace_id),
         key=lambda item: item["number"],
     )
-    panes = [item for item in state.get("panes", []) if item["workspace_id"] == workspace_id]
+    panes_by_tab: dict[str, list[dict]] = {}
+    for pane in state.get("panes", []):
+        if pane["workspace_id"] == workspace_id:
+            panes_by_tab.setdefault(pane["tab_id"], []).append(pane)
     return [
         pane
         for tab in tabs
-        for pane in sorted(
-            (item for item in panes if item["tab_id"] == tab["tab_id"]),
-            key=lambda item: item["pane_id"],
-        )
+        for pane in sorted(panes_by_tab.get(tab["tab_id"], []), key=lambda item: item["pane_id"])
     ]
 
 def default_workspace_pane_index(
@@ -285,8 +285,10 @@ def workspace_preview(state: dict, workspace_id: str, target_id: str | None = No
         (item for item in state.get("tabs", []) if item["workspace_id"] == workspace_id),
         key=lambda item: item["number"],
     )
-    panes = [item for item in state.get("panes", []) if item["workspace_id"] == workspace_id]
     ordered_panes = ordered_workspace_panes(state, workspace_id)
+    panes_by_tab: dict[str, list[dict]] = {}
+    for pane in ordered_panes:
+        panes_by_tab.setdefault(pane["tab_id"], []).append(pane)
     default_pane = default_workspace_pane_index(state, workspace_id, ordered_panes)
     pane_index = next(
         (index for index, pane in enumerate(ordered_panes) if pane["pane_id"] == target_id),
@@ -305,10 +307,7 @@ def workspace_preview(state: dict, workspace_id: str, target_id: str | None = No
             f"{clean(tab.get('label') or tab['tab_id'])}  "
             f"{status_label(tab.get('agent_status'))}"
         )
-        tab_panes = sorted(
-            (item for item in panes if item["tab_id"] == tab["tab_id"]),
-            key=lambda item: item["pane_id"],
-        )
+        tab_panes = panes_by_tab.get(tab["tab_id"], [])
         trunk = "   " if tab_last else "│  "
         for tab_pane_index, pane in enumerate(tab_panes):
             pane_branch = "└─" if tab_pane_index == len(tab_panes) - 1 else "├─"
